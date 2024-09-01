@@ -7,8 +7,8 @@ from contextlib import redirect_stdout
 from torch.nn import functional as F
 
 # hyperparameters
-batch_size = 16
-block_size = 128
+batch_size = 64
+block_size = 256
 max_iters = 5000
 eval_interval = 500
 learning_rate = 3e-4
@@ -17,7 +17,7 @@ eval_iters = 200
 n_embd = 256
 n_head = 4
 n_layer = 4
-dropout = 0.1
+dropout = 0.2
 save_path = 'gpt_language_model.pth'
 # ------------
 
@@ -60,20 +60,6 @@ def get_batch(split):
     y = torch.stack([data[i+1:i+block_size+1] for i in ix])
     x, y = x.to(device), y.to(device)
     return x, y
-
-@torch.no_grad()
-def estimate_loss():
-    out = {}
-    model.eval()
-    for split in ['train', 'val']:
-        losses = torch.zeros(eval_iters)
-        for k in range(eval_iters):
-            X, Y = get_batch(split)
-            logits, loss = model(X, Y)
-            losses[k] = loss.item()
-        out[split] = losses.mean()
-    model.train()
-    return out
 
 class Head(nn.Module):
     """ one head of self-attention """
@@ -210,28 +196,41 @@ class GPTLanguageModel(nn.Module):
         return idx
     
     def train_model(self):
+        @torch.no_grad()
+        def estimate_loss(model):
+            out = {}
+            model.eval()
+            for split in ['train', 'val']:
+                losses = torch.zeros(eval_iters)
+                for k in range(eval_iters):
+                    X, Y = get_batch(split)
+                    logits, loss = model(X, Y)
+                    losses[k] = loss.item()
+                out[split] = losses.mean()
+            model.train()
+            return out
         # create a PyTorch optimizer
-        optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
+        optimizer = torch.optim.AdamW(self.parameters(), lr=learning_rate)
 
         for iter in range(max_iters):
 
             # every once in a while evaluate the loss on train and val sets
             if iter % eval_interval == 0 or iter == max_iters - 1:
-                losses = estimate_loss()
+                losses = estimate_loss(self)
                 print(f"step {iter}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
 
             # sample a batch of data
             xb, yb = get_batch('train')
 
             # evaluate the loss
-            logits, loss = model(xb, yb)
+            logits, loss = self(xb, yb)
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             optimizer.step()
 
             # Save the model at the end of training
             if iter == max_iters - 1:
-                torch.save(model.state_dict(), save_path)
+                torch.save(self.state_dict(), save_path)
                 print(f"Model saved to {save_path}")
 
 def main():

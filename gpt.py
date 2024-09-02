@@ -5,6 +5,10 @@ import torch
 import torch.nn as nn
 from contextlib import redirect_stdout
 from torch.nn import functional as F
+import requests
+from warcio.archiveiterator import ArchiveIterator
+import io
+import gzip
 
 # hyperparameters
 batch_size = 64
@@ -21,16 +25,6 @@ dropout = 0.2
 save_path = 'gpt_language_model.pth'
 # ------------
 
-# Train SentencePiece model using Python API
-spm.SentencePieceTrainer.train(
-    input='input.txt',
-    model_prefix='spm_model',
-    vocab_size=10770
-)
-
-# Load the trained SentencePiece model
-sp = spm.SentencePieceProcessor(model_file='spm_model.model')
-
 # Encoding function
 def encode(text):
     return sp.encode(text, out_type=int)
@@ -39,21 +33,77 @@ def encode(text):
 def decode(tokens):
     return sp.decode(tokens)
 
-# Encode using SentencePiece
-text = open('input.txt', 'r', encoding='utf-8').read()
-encoded_text = encode(text)
+def fetch_file_from_https(url):
+    response = requests.get(url, stream=True)
+    response.raise_for_status()
+    return io.BytesIO(response.content)
+
+def extract_text_from_warc(warc_buffer):
+    text = []
+    for record in ArchiveIterator(warc_buffer):
+        if record.http_headers and record.http_headers.get_header('Content-Type') == 'text/html':
+            payload = record.content_stream().read()
+            html = payload.decode('utf-8', errors='ignore')
+            text.append(html)
+    return text
+
+def stream_data_from_warc_files(warc_paths, max_size_gb=2):
+    print("Stream data...")
+    i = 0
+    total_size = 0
+    max_size_bytes = max_size_gb * 1024 * 1024 * 1024
+    for warc_path in warc_paths:
+        i = i + 1
+        print(f"Processing path {i}")
+        warc_url = f'https://data.commoncrawl.org/{warc_path}'
+        response = requests.get(warc_url, stream=True)
+        response.raise_for_status()
+        with io.BytesIO(response.content) as warc_buffer:
+            for chunk in extract_text_from_warc(warc_buffer):
+                chunk_size = len(chunk)
+                total_size += chunk_size
+                print(f"Total size: {total_size} bytes")
+                if (total_size > max_size_bytes):
+                    return
+                yield chunk
+
+def get_warc_paths():
+    # Download the WARC paths list
+    paths_url = 'https://data.commoncrawl.org/crawl-data/CC-MAIN-2024-33/warc.paths.gz'
+    response = requests.get(paths_url, stream=True)
+    response.raise_for_status()
+    with io.BytesIO(response.content) as f:
+        with gzip.open(f, 'rt') as g:
+            return [line.strip() for line in g]
 
 # Create training and validation data
-data = torch.tensor(encoded_text, dtype=torch.long)
-n = int(0.9*len(data))  # first 90% for training, rest for validation
-train_data = data[:n]
-val_data = data[n:]
+def create_data_stream():
+    warc_paths = get_warc_paths()
+    encoded_text = []
+    i = 0
+    for chunk in stream_data_from_warc_files(warc_paths):
+        encoded_chunk = encode(chunk)
+        encoded_text.extend(chunk)
+    data = torch.tensor(encoded_text, dtype=torch.long)
+    n = int(0.9 * len(data))  # first 90% for training, rest for validation
+    # Train SentencePiece model
+    spm.SentencePieceTrainer.train(
+    input='input.txt',
+    model_prefix='spm_model',
+    vocab_size=10770
+    )
+    print("Finish creating data stream")
+    return data[:n], data[n:]
+
+# Load the trained SentencePiece model
+sp = spm.SentencePieceProcessor(model_file='spm_model.model')
+
+train_data, val_data = create_data_stream()
 
 vocab_size = sp.get_piece_size()
 
 # data loading
 def get_batch(split):
-    # generate a small batch of data of inputs x and targets y
     data = train_data if split == 'train' else val_data
     ix = torch.randint(len(data) - block_size, (batch_size,))
     x = torch.stack([data[i:i+block_size] for i in ix])
@@ -74,17 +124,13 @@ class Head(nn.Module):
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
-        # input of size (batch, time-step, channels)
-        # output of size (batch, time-step, head size)
-        B,T,C = x.shape
+        B, T, C = x.shape
         k = self.key(x)   # (B,T,hs)
         q = self.query(x) # (B,T,hs)
-        # compute attention scores ("affinities")
-        wei = q @ k.transpose(-2,-1) * k.shape[-1]**-0.5 # (B, T, hs) @ (B, hs, T) -> (B, T, T)
+        wei = q @ k.transpose(-2, -1) * k.shape[-1]**-0.5 # (B, T, hs) @ (B, hs, T) -> (B, T, T)
         wei = wei.masked_fill(self.tril[:T, :T] == 0, float('-inf')) # (B, T, T)
         wei = F.softmax(wei, dim=-1) # (B, T, T)
         wei = self.dropout(wei)
-        # perform the weighted aggregation of the values
         v = self.value(x) # (B,T,hs)
         out = wei @ v # (B, T, T) @ (B, T, hs) -> (B, T, hs)
         return out
@@ -122,7 +168,6 @@ class Block(nn.Module):
     """ Transformer block: communication followed by computation """
 
     def __init__(self, n_embd, n_head):
-        # n_embd: embedding dimension, n_head: the number of heads we'd like
         super().__init__()
         head_size = n_embd // n_head
         self.sa = MultiHeadAttention(n_head, head_size)
@@ -139,14 +184,11 @@ class GPTLanguageModel(nn.Module):
 
     def __init__(self):
         super().__init__()
-        # each token directly reads off the logits for the next token from a lookup table
         self.token_embedding_table = nn.Embedding(vocab_size, n_embd)
         self.position_embedding_table = nn.Embedding(block_size, n_embd)
         self.blocks = nn.Sequential(*[Block(n_embd, n_head=n_head) for _ in range(n_layer)])
-        self.ln_f = nn.LayerNorm(n_embd) # final layer norm
+        self.ln_f = nn.LayerNorm(n_embd)
         self.lm_head = nn.Linear(n_embd, vocab_size)
-
-        # better init, not covered in the original GPT video, but important, will cover in followup video
         self.apply(self._init_weights)
 
     def _init_weights(self, module):
@@ -159,14 +201,12 @@ class GPTLanguageModel(nn.Module):
 
     def forward(self, idx, targets=None):
         B, T = idx.shape
-
-        # idx and targets are both (B,T) tensor of integers
-        tok_emb = self.token_embedding_table(idx) # (B,T,C)
-        pos_emb = self.position_embedding_table(torch.arange(T, device=device)) # (T,C)
-        x = tok_emb + pos_emb # (B,T,C)
-        x = self.blocks(x) # (B,T,C)
-        x = self.ln_f(x) # (B,T,C)
-        logits = self.lm_head(x) # (B,T,vocab_size)
+        tok_emb = self.token_embedding_table(idx)
+        pos_emb = self.position_embedding_table(torch.arange(T, device=device))
+        x = tok_emb + pos_emb
+        x = self.blocks(x)
+        x = self.ln_f(x)
+        logits = self.lm_head(x)
 
         if targets is None:
             loss = None
@@ -179,23 +219,17 @@ class GPTLanguageModel(nn.Module):
         return logits, loss
 
     def generate(self, idx, max_new_tokens):
-        # idx is (B, T) array of indices in the current context
         for _ in range(max_new_tokens):
-            # crop idx to the last block_size tokens
             idx_cond = idx[:, -block_size:]
-            # get the predictions
             logits, loss = self(idx_cond)
-            # focus only on the last time step
-            logits = logits[:, -1, :] # becomes (B, C)
-            # apply softmax to get probabilities
-            probs = F.softmax(logits, dim=-1) # (B, C)
-            # sample from the distribution
-            idx_next = torch.multinomial(probs, num_samples=1) # (B, 1)
-            # append sampled index to the running sequence
-            idx = torch.cat((idx, idx_next), dim=1) # (B, T+1)
+            logits = logits[:, -1, :]
+            probs = F.softmax(logits, dim=-1)
+            idx_next = torch.multinomial(probs, num_samples=1)
+            idx = torch.cat((idx, idx_next), dim=1)
         return idx
-    
+
     def train_model(self):
+        print("Beginning GPT training...")
         @torch.no_grad()
         def estimate_loss(model):
             out = {}
@@ -209,50 +243,23 @@ class GPTLanguageModel(nn.Module):
                 out[split] = losses.mean()
             model.train()
             return out
-        # create a PyTorch optimizer
+
         optimizer = torch.optim.AdamW(self.parameters(), lr=learning_rate)
 
         for iter in range(max_iters):
-
-            # every once in a while evaluate the loss on train and val sets
-            if iter % eval_interval == 0 or iter == max_iters - 1:
+            if iter % eval_interval == 0:
                 losses = estimate_loss(self)
                 print(f"step {iter}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
 
-            # sample a batch of data
-            xb, yb = get_batch('train')
-
-            # evaluate the loss
-            logits, loss = self(xb, yb)
-            optimizer.zero_grad(set_to_none=True)
+            X, Y = get_batch('train')
+            logits, loss = self(X, Y)
+            optimizer.zero_grad()
             loss.backward()
             optimizer.step()
 
-            # Save the model at the end of training
-            if iter == max_iters - 1:
+            if iter % eval_interval == 0:
                 torch.save(self.state_dict(), save_path)
-                print(f"Model saved to {save_path}")
 
-def main():
-    parser = argparse.ArgumentParser(description='Train or generate with the GPT model.')
-    parser.add_argument('-t', '--train', action='store_true', help='Train the model')
-    parser.add_argument('-g', '--generate', action='store_true', help='Generate text from the model')
-    args = parser.parse_args()
-
+if __name__ == "__main__":
     model = GPTLanguageModel().to(device)
-    
-    if args.train:
-        model.train_model()
-    elif args.generate:
-        model.load_state_dict(torch.load(save_path, weights_only=True))
-        model.eval()
-        context = torch.zeros((1, 1), dtype=torch.long, device=device)
-        generated = model.generate(context, max_new_tokens=500)
-        generated_text = decode(generated[0].tolist())
-        print(generated_text)
-        open('more.txt', 'w').write(decode(model.generate(context, max_new_tokens=10000)[0].tolist()))
-    else:
-        print("Please specify either -t (train) or -g (generate)")
-
-if __name__ == '__main__':
-    main()
+    model.train_model()

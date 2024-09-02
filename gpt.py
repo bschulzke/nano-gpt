@@ -1,9 +1,11 @@
 import argparse
 import sentencepiece as spm
 import sys
+import os
 import torch
 import torch.nn as nn
 from contextlib import redirect_stdout
+import tempfile
 from torch.nn import functional as F
 import requests
 from warcio.archiveiterator import ArchiveIterator
@@ -47,8 +49,9 @@ def extract_text_from_warc(warc_buffer):
             text.append(html)
     return text
 
-def stream_data_from_warc_files(warc_paths, max_size_gb=2):
+def stream_data_from_warc_files(max_size_gb=2):
     print("Stream data...")
+    warc_paths = get_warc_paths()
     i = 0
     total_size = 0
     max_size_bytes = max_size_gb * 1024 * 1024 * 1024
@@ -77,23 +80,48 @@ def get_warc_paths():
             return [line.strip() for line in g]
 
 # Create training and validation data
-def create_data_stream():
-    warc_paths = get_warc_paths()
-    encoded_text = []
-    i = 0
-    for chunk in stream_data_from_warc_files(warc_paths):
-        encoded_chunk = encode(chunk)
-        encoded_text.extend(chunk)
-    data = torch.tensor(encoded_text, dtype=torch.long)
-    n = int(0.9 * len(data))  # first 90% for training, rest for validation
-    # Train SentencePiece model
-    spm.SentencePieceTrainer.train(
-    input='input.txt',
-    model_prefix='spm_model',
-    vocab_size=10770
-    )
-    print("Finish creating data stream")
+def get_train_and_val_data(max_size_gb=2):
+    print("Getting training and validation data...")
+
+    data_chunks = []
+
+    for chunk in stream_data_from_warc_files(max_size_gb=max_size_gb):
+        data_chunks.append(chunk)
+
+    # Combine all chunks into a single string
+    full_text = ''.join(data_chunks)
+
+    encoded_data = encode(full_text)
+    data = torch.tensor(encoded_data, dtype=torch.long)
+
+    n = int(0.9 * len(data))  # First 90% for training, rest for validation
     return data[:n], data[n:]
+
+def train_vocab(max_size_gb=2):
+    print("Training SentencePiece vocabulary...")
+
+    # Create a temporary file to store the streamed data
+    with tempfile.NamedTemporaryFile(delete=False, mode='w', encoding='utf-8') as temp_file:
+        temp_filename = temp_file.name
+        print(f"Temporary file created: {temp_filename}")
+
+        # Stream data and write to the temporary file
+        for chunk in stream_data_from_warc_files(max_size_gb=max_size_gb):
+            temp_file.write(chunk)
+
+        # Close the file to ensure all data is written
+        temp_file.close()
+
+        # Train SentencePiece model using the temporary file
+        spm.SentencePieceTrainer.train(
+            input=temp_filename,
+            model_prefix='spm_model',
+            vocab_size=10770
+        )
+
+        # Remove the temporary file after training
+        os.remove(temp_filename)
+        print("Temporary file removed.")
 
 # data loading
 def get_batch(split):
@@ -252,13 +280,27 @@ class GPTLanguageModel(nn.Module):
 
             if iter % eval_interval == 0:
                 torch.save(self.state_dict(), save_path)
+                print(f"Model saved to {save_path}")
 
-if __name__ == "__main__":
-    # Load the trained SentencePiece model
+def main():
+    arguments = sys.argv[1:]
+    if (len(arguments) < 1):
+        print("Specificy one: -v (train vocab), -t (train), -g (generate)")
+        return
+
+    if ('-v' in arguments):
+        train_vocab()
+
     sp = spm.SentencePieceProcessor(model_file='spm_model.model')
 
-    train_data, val_data = create_data_stream()
+    train_data, val_data = get_train_and_val_data()
 
     vocab_size = sp.get_piece_size()
     model = GPTLanguageModel().to(device)
-    model.train_model()
+    if ('-t' in arguments):
+        model.train_model()
+    if ('-g' in arguments):
+        open('more.txt', 'w').write(decode(model.generate(context, max_new_tokens=10000)[0].tolist()))
+
+if __name__ == "__main__":
+    main()

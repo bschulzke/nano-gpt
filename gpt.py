@@ -95,13 +95,6 @@ def create_data_stream():
     print("Finish creating data stream")
     return data[:n], data[n:]
 
-# Load the trained SentencePiece model
-sp = spm.SentencePieceProcessor(model_file='spm_model.model')
-
-train_data, val_data = create_data_stream()
-
-vocab_size = sp.get_piece_size()
-
 # data loading
 def get_batch(split):
     data = train_data if split == 'train' else val_data
@@ -261,5 +254,11 @@ class GPTLanguageModel(nn.Module):
                 torch.save(self.state_dict(), save_path)
 
 if __name__ == "__main__":
+    # Load the trained SentencePiece model
+    sp = spm.SentencePieceProcessor(model_file='spm_model.model')
+
+    train_data, val_data = create_data_stream()
+
+    vocab_size = sp.get_piece_size()
     model = GPTLanguageModel().to(device)
     model.train_model()

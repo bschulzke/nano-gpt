@@ -25,15 +25,8 @@ n_head = 4
 n_layer = 4
 dropout = 0.2
 save_path = 'gpt_language_model.pth'
+max_crawl_data_gb = 2
 # ------------
-
-# Encoding function
-def encode(text):
-    return sp.encode(text, out_type=int)
-
-# Decoding function
-def decode(tokens):
-    return sp.decode(tokens)
 
 def fetch_file_from_https(url):
     response = requests.get(url, stream=True)
@@ -49,12 +42,13 @@ def extract_text_from_warc(warc_buffer):
             text.append(html)
     return text
 
-def stream_data_from_warc_files(max_size_gb=2):
+def stream_data_from_warc_files(max_size_gb=max_crawl_data_gb):
     print("Stream data...")
     warc_paths = get_warc_paths()
     i = 0
     total_size = 0
     max_size_bytes = max_size_gb * 1024 * 1024 * 1024
+    print(f"Max size: {max_size_bytes}")
     for warc_path in warc_paths:
         i = i + 1
         print(f"Processing path {i}")
@@ -66,6 +60,7 @@ def stream_data_from_warc_files(max_size_gb=2):
                 chunk_size = len(chunk)
                 total_size += chunk_size
                 print(f"Total size: {total_size} bytes")
+                print(f"Max size: {max_size_bytes}")
                 if (total_size > max_size_bytes):
                     return
                 yield chunk
@@ -80,24 +75,24 @@ def get_warc_paths():
             return [line.strip() for line in g]
 
 # Create training and validation data
-def get_train_and_val_data(max_size_gb=2):
+def get_train_and_val_data(sp):
     print("Getting training and validation data...")
 
     data_chunks = []
 
-    for chunk in stream_data_from_warc_files(max_size_gb=max_size_gb):
+    for chunk in stream_data_from_warc_files():
         data_chunks.append(chunk)
 
     # Combine all chunks into a single string
     full_text = ''.join(data_chunks)
 
-    encoded_data = encode(full_text)
+    encoded_data = sp.encode(full_text)
     data = torch.tensor(encoded_data, dtype=torch.long)
 
     n = int(0.9 * len(data))  # First 90% for training, rest for validation
     return data[:n], data[n:]
 
-def train_vocab(max_size_gb=2):
+def train_vocab():
     print("Training SentencePiece vocabulary...")
 
     # Create a temporary file to store the streamed data
@@ -106,7 +101,7 @@ def train_vocab(max_size_gb=2):
         print(f"Temporary file created: {temp_filename}")
 
         # Stream data and write to the temporary file
-        for chunk in stream_data_from_warc_files(max_size_gb=max_size_gb):
+        for chunk in stream_data_from_warc_files():
             temp_file.write(chunk)
 
         # Close the file to ensure all data is written
@@ -122,15 +117,6 @@ def train_vocab(max_size_gb=2):
         # Remove the temporary file after training
         os.remove(temp_filename)
         print("Temporary file removed.")
-
-# data loading
-def get_batch(split):
-    data = train_data if split == 'train' else val_data
-    ix = torch.randint(len(data) - block_size, (batch_size,))
-    x = torch.stack([data[i:i+block_size] for i in ix])
-    y = torch.stack([data[i+1:i+block_size+1] for i in ix])
-    x, y = x.to(device), y.to(device)
-    return x, y
 
 class Head(nn.Module):
     """ one head of self-attention """
@@ -203,7 +189,7 @@ class Block(nn.Module):
 
 class GPTLanguageModel(nn.Module):
 
-    def __init__(self):
+    def __init__(self, sp, vocab_size):
         super().__init__()
         self.token_embedding_table = nn.Embedding(vocab_size, n_embd)
         self.position_embedding_table = nn.Embedding(block_size, n_embd)
@@ -211,6 +197,7 @@ class GPTLanguageModel(nn.Module):
         self.ln_f = nn.LayerNorm(n_embd)
         self.lm_head = nn.Linear(n_embd, vocab_size)
         self.apply(self._init_weights)
+        self.sp = sp
 
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
@@ -219,6 +206,21 @@ class GPTLanguageModel(nn.Module):
                 torch.nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+    
+    def encode(self, text):
+        return self.sp.encode(text, out_type=int)
+
+    def decode(self, tokens):
+        return self.sp.decode(tokens)
+    
+    # data loading
+    def get_batch(self, split):
+        data = self.train_data if split == 'train' else self.val_data
+        ix = torch.randint(len(data) - block_size, (batch_size,))
+        x = torch.stack([data[i:i+block_size] for i in ix])
+        y = torch.stack([data[i+1:i+block_size+1] for i in ix])
+        x, y = x.to(device), y.to(device)
+        return x, y
 
     def forward(self, idx, targets=None):
         B, T = idx.shape
@@ -249,8 +251,10 @@ class GPTLanguageModel(nn.Module):
             idx = torch.cat((idx, idx_next), dim=1)
         return idx
 
-    def train_model(self):
+    def train_model(self, train_data, val_data):
         print("Beginning GPT training...")
+        self.train_data = train_data
+        self.val_data = val_data
         @torch.no_grad()
         def estimate_loss(model):
             out = {}
@@ -258,7 +262,7 @@ class GPTLanguageModel(nn.Module):
             for split in ['train', 'val']:
                 losses = torch.zeros(eval_iters)
                 for k in range(eval_iters):
-                    X, Y = get_batch(split)
+                    X, Y = self.get_batch(split)
                     logits, loss = model(X, Y)
                     losses[k] = loss.item()
                 out[split] = losses.mean()
@@ -272,13 +276,13 @@ class GPTLanguageModel(nn.Module):
                 losses = estimate_loss(self)
                 print(f"step {iter}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
 
-            X, Y = get_batch('train')
+            X, Y = self.get_batch('train')
             logits, loss = self(X, Y)
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
 
-            if iter % eval_interval == 0:
+            if iter == max_iters - 1:
                 torch.save(self.state_dict(), save_path)
                 print(f"Model saved to {save_path}")
 
@@ -293,14 +297,15 @@ def main():
 
     sp = spm.SentencePieceProcessor(model_file='spm_model.model')
 
-    train_data, val_data = get_train_and_val_data()
 
     vocab_size = sp.get_piece_size()
-    model = GPTLanguageModel().to(device)
+    model = GPTLanguageModel(sp, vocab_size).to(device)
     if ('-t' in arguments):
-        model.train_model()
+        train_data, val_data = get_train_and_val_data(sp)
+        model.train_model(train_data, val_data)
     if ('-g' in arguments):
-        open('more.txt', 'w').write(decode(model.generate(context, max_new_tokens=10000)[0].tolist()))
+        context = torch.zeros((1, 1), dtype=torch.long, device=device)
+        open('output.txt', 'w').write(model.decode(model.generate(context, max_new_tokens=10000)[0].tolist()))
 
 if __name__ == "__main__":
     main()
